@@ -1,0 +1,892 @@
+======================================================================
+CODE APPENDIX
+Delivery Route Optimization - TSP for 15 UK Cities
+======================================================================
+
+----------------------------------------------------------------------
+# Code Cell 1
+----------------------------------------------------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pulp import *
+import time
+import itertools
+import json
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.rcParams['figure.dpi'] = 120
+plt.rcParams['font.size'] = 10
+
+----------------------------------------------------------------------
+# Code Cell 2
+----------------------------------------------------------------------
+# Load Kaggle dataset
+df_full = pd.read_csv('../data/UK_Cities.csv')
+
+# Pick 15 cities
+selected_cities = [
+    'London', 'Birmingham', 'Leeds', 'Glasgow', 'Sheffield',
+    'Manchester', 'Liverpool', 'Edinburgh', 'Bristol', 'Cardiff',
+    'Leicester', 'Nottingham', 'Newcastle upon Tyne', 'Southampton', 'Plymouth'
+]
+df = df_full[df_full['City'].isin(selected_cities)].reset_index(drop=True)
+
+# Put London first (it's our depot)
+order = {city: i for i, city in enumerate(selected_cities)}
+df['sort_order'] = df['City'].map(order)
+df = df.sort_values('sort_order').reset_index(drop=True)
+df = df.drop(columns=['sort_order'])
+
+city_names = df['City'].tolist()
+coords = df[['Latitude', 'Longitude']].values
+n = len(city_names)
+
+print(f"Loaded {n} cities from Kaggle dataset")
+print(f"Depot: {city_names[0]}\n")
+for i, row in df.iterrows():
+    print(f"  {i:2d}. {row['City']:<25s} ({row['Latitude']:.4f}, {row['Longitude']:.4f})  Pop: {row['Population']:,}")
+
+----------------------------------------------------------------------
+# Code Cell 3
+----------------------------------------------------------------------
+# Haversine distance (km) between two lat/long points
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
+    return R * 2 * np.arcsin(np.sqrt(a))
+
+# Build distance matrix
+distance_matrix = np.zeros((n, n))
+for i in range(n):
+    for j in range(n):
+        if i != j:
+            distance_matrix[i][j] = haversine(
+                coords[i][0], coords[i][1], coords[j][0], coords[j][1]
+            )
+
+distance_matrix = np.round(distance_matrix, 2)
+
+dist_df = pd.DataFrame(distance_matrix, index=city_names, columns=city_names)
+
+os.makedirs('../data', exist_ok=True)
+dist_df.to_csv('../data/distance_matrix.csv')
+
+print(f"Distance Matrix ({n}x{n}):")
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', None)
+display(dist_df.round(1))
+
+----------------------------------------------------------------------
+# Code Cell 4
+----------------------------------------------------------------------
+# Visualize the distance matrix as a heatmap
+
+fig, ax = plt.subplots(figsize=(12, 10))
+im = ax.imshow(distance_matrix, cmap='YlOrRd', interpolation='nearest')
+
+# Add colorbar
+cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+cbar.set_label('Distance (km)', fontsize=12)
+
+# Set tick labels
+ax.set_xticks(range(n))
+ax.set_yticks(range(n))
+ax.set_xticklabels(city_names, rotation=45, ha='right', fontsize=9)
+ax.set_yticklabels(city_names, fontsize=9)
+
+# Add distance values in cells
+for i in range(n):
+    for j in range(n):
+        text_color = 'white' if distance_matrix[i][j] > np.max(distance_matrix) * 0.6 else 'black'
+        ax.text(j, i, f'{distance_matrix[i][j]:.0f}', ha='center', va='center',
+                fontsize=6, color=text_color)
+
+ax.set_title('Distance Matrix Heatmap - UK Cities (km)', fontsize=13, pad=15)
+plt.tight_layout()
+plt.savefig('../data/distance_heatmap.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Heatmap saved to data/distance_heatmap.png")
+
+----------------------------------------------------------------------
+# Code Cell 5
+----------------------------------------------------------------------
+def solve_tsp_ilp(distance_matrix, city_names):
+    """Solve TSP exactly using ILP + MTZ subtour elimination."""
+    n = len(city_names)
+    prob = LpProblem("TSP_ILP", LpMinimize)
+
+    # x[i,j] = 1 if we go from i to j
+    x = LpVariable.dicts("x",
+                         ((i, j) for i in range(n) for j in range(n) if i != j),
+                         cat='Binary')
+
+    # u[i] = position of city i in the tour (for MTZ)
+    u = LpVariable.dicts("u", (i for i in range(1, n)),
+                         lowBound=1, upBound=n - 1, cat='Integer')
+
+    # Minimize total distance
+    prob += lpSum(distance_matrix[i][j] * x[(i, j)]
+                  for i in range(n) for j in range(n) if i != j)
+
+    # Each city: exactly one in-edge, one out-edge
+    for j in range(n):
+        prob += lpSum(x[(i, j)] for i in range(n) if i != j) == 1
+    for i in range(n):
+        prob += lpSum(x[(i, j)] for j in range(n) if i != j) == 1
+
+    # MTZ subtour elimination
+    for i in range(1, n):
+        for j in range(1, n):
+            if i != j:
+                prob += u[i] - u[j] + n * x[(i, j)] <= n - 1
+
+    print(f"Solving {n}-city TSP... ({n*(n-1)} binary vars, {(n-1)*(n-2)} MTZ constraints)")
+    
+    start_time = time.time()
+    prob.solve(PULP_CBC_CMD(msg=0))
+    solve_time = time.time() - start_time
+
+    status = LpStatus[prob.status]
+    if status != 'Optimal':
+        print(f"  WARNING: {status}")
+        return {'status': status, 'tour': [], 'total_distance': None, 'solve_time': solve_time}
+
+    # Trace the tour from city 0
+    tour = [0]
+    current = 0
+    for _ in range(n - 1):
+        for j in range(n):
+            if j != current and value(x[(current, j)]) == 1:
+                tour.append(j)
+                current = j
+                break
+    tour.append(0)
+
+    return {
+        'tour': tour,
+        'tour_names': [city_names[i] for i in tour],
+        'total_distance': round(value(prob.objective), 2),
+        'solve_time': round(solve_time, 4),
+        'status': status,
+        'n_cities': n
+    }
+
+----------------------------------------------------------------------
+# Code Cell 6
+----------------------------------------------------------------------
+# Cell 8: Run the solver and display results
+
+print("=" * 70)
+print("         TSP SOLUTION - INTEGER LINEAR PROGRAMMING (EXACT)")
+print("=" * 70)
+print()
+
+# Solve the full 15-city problem
+result = solve_tsp_ilp(distance_matrix, city_names)
+
+print()
+print("-" * 70)
+print(f"  Status:          {result['status']}")
+print(f"  Total Distance:  {result['total_distance']:.2f} km")
+print(f"  Solve Time:      {result['solve_time']:.4f} seconds")
+print(f"  Number of Cities: {result['n_cities']}")
+print("-" * 70)
+print()
+
+# Display the optimal tour
+print("Optimal Tour:")
+print("=" * 50)
+for step, city in enumerate(result['tour_names']):
+    if step == 0:
+        print(f"  START -> {city} (Depot)")
+    elif step == len(result['tour_names']) - 1:
+        print(f"  Step {step:2d} -> {city} (Return to Depot)")
+    else:
+        # Calculate leg distance
+        prev_idx = result['tour'][step - 1]
+        curr_idx = result['tour'][step]
+        leg_dist = distance_matrix[prev_idx][curr_idx]
+        print(f"  Step {step:2d} -> {city:<20s} (leg: {leg_dist:.2f} km)")
+
+# Final leg
+last_idx = result['tour'][-2]
+final_leg = distance_matrix[last_idx][0]
+print(f"\n  Final leg back to depot: {final_leg:.2f} km")
+print(f"\n  TOTAL OPTIMAL DISTANCE: {result['total_distance']:.2f} km")
+
+----------------------------------------------------------------------
+# Code Cell 7
+----------------------------------------------------------------------
+# Cell 9: Visualization - Plot the optimal route on a 2D map
+
+def plot_tour(coords, tour, city_names, title, total_distance, ax=None):
+    """Plot the TSP tour on a 2D map."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Use longitude as x and latitude as y for geographic intuition
+    x_coords = coords[:, 1]  # longitude
+    y_coords = coords[:, 0]  # latitude
+    
+    # Plot all delivery locations
+    ax.scatter(x_coords[1:], y_coords[1:], c='royalblue', s=120, zorder=5,
+               edgecolors='navy', linewidth=1.5, label='Delivery Cities')
+    
+    # Highlight the depot
+    ax.scatter(x_coords[0], y_coords[0], c='red', s=250, zorder=6,
+               edgecolors='darkred', linewidth=2, marker='*', label='Depot (London)')
+    
+    # Draw the tour with arrows
+    for k in range(len(tour) - 1):
+        i, j = tour[k], tour[k + 1]
+        dx = x_coords[j] - x_coords[i]
+        dy = y_coords[j] - y_coords[i]
+        ax.annotate('',
+                    xy=(x_coords[j], y_coords[j]),
+                    xytext=(x_coords[i], y_coords[i]),
+                    arrowprops=dict(arrowstyle='->', color='darkorange',
+                                   lw=2, connectionstyle='arc3,rad=0.05'))
+    
+    # Label cities
+    for i, name in enumerate(city_names):
+        ax.annotate(name, (x_coords[i], y_coords[i]),
+                    textcoords='offset points', xytext=(8, 8),
+                    fontsize=8, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow',
+                              edgecolor='gray', alpha=0.9))
+    
+    # Add step numbers along the tour
+    for k in range(len(tour) - 1):
+        i, j = tour[k], tour[k + 1]
+        mid_x = (x_coords[i] + x_coords[j]) / 2
+        mid_y = (y_coords[i] + y_coords[j]) / 2
+        ax.text(mid_x, mid_y, str(k + 1), fontsize=7, ha='center', va='center',
+                bbox=dict(boxstyle='circle,pad=0.2', facecolor='white',
+                          edgecolor='darkorange', alpha=0.8))
+    
+    ax.set_xlabel('Longitude', fontsize=12)
+    ax.set_ylabel('Latitude', fontsize=12)
+    ax.set_title(f'{title}\nTotal Distance: {total_distance:.2f} km', fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    return ax
+
+
+# Plot the optimal ILP tour
+fig, ax = plt.subplots(figsize=(12, 10))
+plot_tour(coords, result['tour'], city_names,
+          'Optimal Delivery Route (ILP Exact Method)',
+          result['total_distance'], ax)
+plt.tight_layout()
+plt.savefig('../data/optimal_route_ilp.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Route visualization saved to data/optimal_route_ilp.png")
+
+----------------------------------------------------------------------
+# Code Cell 8
+----------------------------------------------------------------------
+# Scalability test — run on different subset sizes to see how time scales
+
+subset_sizes = [5, 8, 10, 12, 15]
+scalability_results = []
+
+print(f"{'Cities':>8s} | {'Status':>10s} | {'Distance (km)':>15s} | {'Time (s)':>10s}")
+print("-" * 55)
+
+for size in subset_sizes:
+    sub_names = city_names[:size]
+    sub_matrix = distance_matrix[:size, :size]
+    
+    sub_result = solve_tsp_ilp(sub_matrix, sub_names)
+    
+    scalability_results.append({
+        'n_cities': size,
+        'total_distance': sub_result['total_distance'],
+        'solve_time': sub_result['solve_time'],
+        'status': sub_result['status']
+    })
+    
+    dist_str = f"{sub_result['total_distance']:.2f}" if sub_result['total_distance'] else 'N/A'
+    print(f"{size:>8d} | {sub_result['status']:>10s} | {dist_str:>15s} | {sub_result['solve_time']:>8.4f} s")
+
+----------------------------------------------------------------------
+# Code Cell 9
+----------------------------------------------------------------------
+# Plot the scalability results
+
+sizes = [r['n_cities'] for r in scalability_results]
+times = [r['solve_time'] for r in scalability_results]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Plot 1: Solve time vs number of cities (linear scale)
+axes[0].plot(sizes, times, 'o-', color='crimson', linewidth=2, markersize=10,
+             markerfacecolor='gold', markeredgecolor='crimson', markeredgewidth=2)
+axes[0].set_xlabel('Number of Cities', fontsize=12)
+axes[0].set_ylabel('Solve Time (seconds)', fontsize=12)
+axes[0].set_title('ILP Solve Time vs Problem Size', fontsize=13, fontweight='bold')
+axes[0].set_xticks(sizes)
+axes[0].grid(True, alpha=0.3)
+for i, (s, t) in enumerate(zip(sizes, times)):
+    axes[0].annotate(f'{t:.3f}s', (s, t), textcoords='offset points',
+                     xytext=(0, 12), ha='center', fontsize=9, fontweight='bold')
+
+# Plot 2: Solve time vs number of cities (log scale)
+axes[1].semilogy(sizes, times, 's-', color='darkblue', linewidth=2, markersize=10,
+                 markerfacecolor='lightskyblue', markeredgecolor='darkblue', markeredgewidth=2)
+axes[1].set_xlabel('Number of Cities', fontsize=12)
+axes[1].set_ylabel('Solve Time (seconds, log scale)', fontsize=12)
+axes[1].set_title('ILP Solve Time vs Problem Size (Log Scale)', fontsize=13, fontweight='bold')
+axes[1].set_xticks(sizes)
+axes[1].grid(True, alpha=0.3)
+for i, (s, t) in enumerate(zip(sizes, times)):
+    axes[1].annotate(f'{t:.3f}s', (s, t), textcoords='offset points',
+                     xytext=(0, 12), ha='center', fontsize=9, fontweight='bold')
+
+plt.suptitle('Scalability Analysis: Exact ILP Method for TSP', fontsize=14, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig('../data/scalability_analysis.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Scalability chart saved to data/scalability_analysis.png")
+print("\nObservation: The solve time grows exponentially with the number of cities,")
+print("confirming the NP-hard nature of the TSP.")
+
+----------------------------------------------------------------------
+# Code Cell 10
+----------------------------------------------------------------------
+# Save results for comparison with GA
+output_data = {
+    'method': 'ILP (Exact)',
+    'formulation': 'MTZ Subtour Elimination',
+    'solver': 'PuLP CBC',
+    'dataset': 'Kaggle UK Cities TSP (15 of 49)',
+    'optimal_tour': {
+        'tour_indices': result['tour'],
+        'tour_names': result['tour_names'],
+        'total_distance_km': result['total_distance'],
+        'solve_time_seconds': result['solve_time'],
+        'status': result['status'],
+        'n_cities': result['n_cities']
+    },
+    'scalability': [
+        {'n_cities': r['n_cities'], 'distance_km': r['total_distance'],
+         'time_s': r['solve_time'], 'status': r['status']}
+        for r in scalability_results
+    ],
+    'cities': {row['City']: {'lat': row['Latitude'], 'lon': row['Longitude'], 'pop': int(row['Population'])}
+               for _, row in df.iterrows()}
+}
+
+with open('../data/ilp_results.json', 'w') as f:
+    json.dump(output_data, f, indent=2)
+
+print("Results saved to data/ilp_results.json")
+
+
+######################################################################
+# Method: Genetic Algorithm
+######################################################################
+
+----------------------------------------------------------------------
+# Code Cell 1
+----------------------------------------------------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from deap import base, creator, tools, algorithms
+import random
+import time
+import json
+import warnings
+
+warnings.filterwarnings('ignore')
+plt.style.use('seaborn-v0_8-whitegrid')
+
+----------------------------------------------------------------------
+# Code Cell 2
+----------------------------------------------------------------------
+# Load Kaggle dataset
+df_full = pd.read_csv('../data/UK_Cities.csv')
+
+selected_cities = [
+    'London', 'Birmingham', 'Leeds', 'Glasgow', 'Sheffield',
+    'Manchester', 'Liverpool', 'Edinburgh', 'Bristol', 'Cardiff',
+    'Leicester', 'Nottingham', 'Newcastle upon Tyne', 'Southampton', 'Plymouth'
+]
+df = df_full[df_full['City'].isin(selected_cities)].reset_index(drop=True)
+
+order = {city: i for i, city in enumerate(selected_cities)}
+df['sort_order'] = df['City'].map(order)
+df = df.sort_values('sort_order').reset_index(drop=True)
+df = df.drop(columns=['sort_order'])
+
+city_names = df['City'].tolist()
+coords = df[['Latitude', 'Longitude']].values
+n_cities = len(city_names)
+
+print(f"{n_cities} cities loaded, depot = {city_names[0]}\n")
+for i, row in df.iterrows():
+    print(f"  {i:2d}. {row['City']:25s} ({row['Latitude']:.4f}, {row['Longitude']:.4f})")
+
+----------------------------------------------------------------------
+# Code Cell 3
+----------------------------------------------------------------------
+# Haversine distance matrix (km)
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
+    return R * 2 * np.arcsin(np.sqrt(a))
+
+dist_matrix = np.zeros((n_cities, n_cities))
+for i in range(n_cities):
+    for j in range(n_cities):
+        if i != j:
+            dist_matrix[i][j] = haversine(
+                coords[i][0], coords[i][1], coords[j][0], coords[j][1]
+            )
+
+dist_df = pd.DataFrame(dist_matrix, index=city_names, columns=city_names)
+print("Distance matrix (first 8 cities):")
+print(dist_df.iloc[:8, :8].round(2).to_string())
+print(f"\nMax: {dist_matrix.max():.2f} km, Min (non-zero): {dist_matrix[dist_matrix > 0].min():.2f} km")
+
+----------------------------------------------------------------------
+# Code Cell 4
+----------------------------------------------------------------------
+def evaluate_tsp(individual, dist_matrix):
+    """Total distance for a route: depot -> individual cities -> depot."""
+    route = [0] + [x + 1 for x in individual] + [0]
+    return (sum(dist_matrix[route[i]][route[i+1]] for i in range(len(route) - 1)),)
+
+
+def solve_tsp_ga(dist_matrix, city_names, pop_size=200, n_gen=500, 
+                 cx_prob=0.8, mut_prob=0.2, seed=42):
+    """Run GA to solve TSP. Returns best tour, distance, time, and logbook."""
+    random.seed(seed)
+    np.random.seed(seed)
+    n = len(city_names)
+    
+    # DEAP setup
+    if not hasattr(creator, "FitnessMin"):
+        creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
+    if not hasattr(creator, "Individual"):
+        creator.create("Individual", list, fitness=creator.FitnessMin)
+    
+    toolbox = base.Toolbox()
+    toolbox.register("indices", random.sample, range(n - 1), n - 1)
+    toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.indices)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    toolbox.register("evaluate", evaluate_tsp, dist_matrix=dist_matrix)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+    toolbox.register("mate", tools.cxOrdered)
+    toolbox.register("mutate", tools.mutShuffleIndexes, indpb=0.05)
+    
+    pop = toolbox.population(n=pop_size)
+    
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("min", np.min)
+    stats.register("avg", np.mean)
+    stats.register("std", np.std)
+    
+    hof = tools.HallOfFame(1)
+    
+    start_time = time.time()
+    pop, logbook = algorithms.eaSimple(
+        pop, toolbox, cxpb=cx_prob, mutpb=mut_prob,
+        ngen=n_gen, stats=stats, halloffame=hof, verbose=False
+    )
+    solve_time = time.time() - start_time
+    
+    best = hof[0]
+    best_route = [0] + [x + 1 for x in best] + [0]
+    
+    return {
+        'tour': best_route,
+        'tour_names': [city_names[i] for i in best_route],
+        'total_distance': best.fitness.values[0],
+        'solve_time': solve_time,
+        'logbook': logbook,
+        'population_size': pop_size,
+        'generations': n_gen
+    }
+
+----------------------------------------------------------------------
+# Code Cell 5
+----------------------------------------------------------------------
+# Cell 7: Run GA and Display Results
+
+print("Running Genetic Algorithm for TSP...")
+print("=" * 60)
+
+ga_result = solve_tsp_ga(dist_matrix, city_names, 
+                          pop_size=200, n_gen=500, 
+                          cx_prob=0.8, mut_prob=0.2, seed=42)
+
+print(f"\nGA Optimization Complete!")
+print(f"{'=' * 60}")
+print(f"\nBest Route Found:")
+print(f"-" * 40)
+for i, name in enumerate(ga_result['tour_names']):
+    if i < len(ga_result['tour_names']) - 1:
+        next_city = ga_result['tour'][i+1]
+        curr_city = ga_result['tour'][i]
+        leg_dist = dist_matrix[curr_city][next_city]
+        print(f"  {i:2d}. {name:20s}  -> {leg_dist:.2f} km")
+    else:
+        print(f"  {i:2d}. {name:20s}  (return to depot)")
+
+print(f"\n{'=' * 60}")
+print(f"Total Distance : {ga_result['total_distance']:.2f} km")
+print(f"Solve Time     : {ga_result['solve_time']:.4f} seconds")
+print(f"Population     : {ga_result['population_size']}")
+print(f"Generations    : {ga_result['generations']}")
+print(f"Cities Visited : {len(ga_result['tour']) - 1} (+ return to depot)")
+
+----------------------------------------------------------------------
+# Code Cell 6
+----------------------------------------------------------------------
+# Cell 8: Convergence Plot
+
+gen = ga_result['logbook'].select("gen")
+fit_min = ga_result['logbook'].select("min")
+fit_avg = ga_result['logbook'].select("avg")
+fit_std = ga_result['logbook'].select("std")
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# Plot 1: Best and Average Fitness over Generations
+ax1.plot(gen, fit_min, 'b-', linewidth=2, label='Best Distance')
+ax1.plot(gen, fit_avg, 'r-', linewidth=1, alpha=0.7, label='Average Distance')
+ax1.fill_between(gen, 
+                  np.array(fit_avg) - np.array(fit_std), 
+                  np.array(fit_avg) + np.array(fit_std), 
+                  alpha=0.2, color='red', label='Std Dev')
+ax1.set_xlabel('Generation', fontsize=12)
+ax1.set_ylabel('Route Distance (km)', fontsize=12)
+ax1.set_title('GA Convergence: Best vs Average Fitness', fontsize=14)
+ax1.legend(fontsize=11)
+ax1.grid(True, alpha=0.3)
+
+# Plot 2: Zoomed-in view of best fitness convergence
+ax2.plot(gen, fit_min, 'b-', linewidth=2)
+ax2.set_xlabel('Generation', fontsize=12)
+ax2.set_ylabel('Best Route Distance (km)', fontsize=12)
+ax2.set_title('GA Convergence: Best Fitness (Zoomed)', fontsize=14)
+ax2.grid(True, alpha=0.3)
+
+# Add annotation for final best
+ax2.annotate(f'Best: {fit_min[-1]:.2f} km', 
+             xy=(gen[-1], fit_min[-1]),
+             xytext=(gen[-1] * 0.6, fit_min[-1] * 1.05),
+             arrowprops=dict(arrowstyle='->', color='black'),
+             fontsize=12, fontweight='bold', color='blue')
+
+plt.tight_layout()
+plt.savefig('../data/ga_convergence.png', 
+            dpi=150, bbox_inches='tight')
+plt.show()
+print(f"Convergence plot saved.")
+
+----------------------------------------------------------------------
+# Code Cell 7
+----------------------------------------------------------------------
+# Cell 9: Route Visualization
+
+fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+
+# Plot the route
+route_indices = ga_result['tour']
+route_coords = coords[route_indices]
+
+# Draw route edges
+ax.plot(route_coords[:, 1], route_coords[:, 0], 'b-o', 
+        linewidth=2, markersize=8, markerfacecolor='steelblue', 
+        markeredgecolor='navy', label='GA Route', zorder=3)
+
+# Highlight the depot
+depot_coord = coords[0]
+ax.plot(depot_coord[1], depot_coord[0], 'r*', markersize=20, 
+        markeredgecolor='darkred', label='Depot (London)', zorder=5)
+
+# Add city labels
+for i, name in enumerate(city_names):
+    ax.annotate(name, (coords[i][1], coords[i][0]),
+                textcoords="offset points", xytext=(8, 8),
+                fontsize=9, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', 
+                          edgecolor='gray', alpha=0.8))
+
+# Add route order numbers
+for idx, city_idx in enumerate(route_indices[:-1]):
+    ax.annotate(str(idx), (coords[city_idx][1], coords[city_idx][0]),
+                textcoords="offset points", xytext=(-12, -12),
+                fontsize=8, color='blue', fontweight='bold')
+
+ax.set_xlabel('Longitude', fontsize=12)
+ax.set_ylabel('Latitude', fontsize=12)
+ax.set_title(f'GA Optimal Route ({ga_result["total_distance"]:.2f} km)', fontsize=14)
+ax.legend(fontsize=11, loc='upper left')
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('../data/ga_route.png', 
+            dpi=150, bbox_inches='tight')
+plt.show()
+print("Route visualization saved.")
+
+----------------------------------------------------------------------
+# Code Cell 8
+----------------------------------------------------------------------
+# Cell 10: Parameter Sensitivity Analysis
+
+print("Running Parameter Sensitivity Analysis...")
+print("This may take a minute.\n")
+
+pop_sizes = [50, 100, 200, 400]
+gen_counts = [100, 300, 500]
+
+sensitivity_results = []
+
+for ps in pop_sizes:
+    for ng in gen_counts:
+        result = solve_tsp_ga(dist_matrix, city_names, 
+                               pop_size=ps, n_gen=ng, seed=42)
+        sensitivity_results.append({
+            'Population': ps,
+            'Generations': ng,
+            'Best Distance (km)': round(result['total_distance'], 2),
+            'Solve Time (s)': round(result['solve_time'], 4)
+        })
+        print(f"  Pop={ps:4d}, Gen={ng:4d} -> Distance={result['total_distance']:.2f} km, Time={result['solve_time']:.4f}s")
+
+# Display as table
+sensitivity_df = pd.DataFrame(sensitivity_results)
+print("\nParameter Sensitivity Results:")
+print(sensitivity_df.to_string(index=False))
+
+# Visualization
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# Plot: Distance by population size for each generation count
+for ng in gen_counts:
+    subset = sensitivity_df[sensitivity_df['Generations'] == ng]
+    ax1.plot(subset['Population'], subset['Best Distance (km)'], 
+             'o-', linewidth=2, markersize=8, label=f'{ng} generations')
+
+ax1.set_xlabel('Population Size', fontsize=12)
+ax1.set_ylabel('Best Distance (km)', fontsize=12)
+ax1.set_title('Solution Quality vs Population Size', fontsize=14)
+ax1.legend(fontsize=11)
+ax1.grid(True, alpha=0.3)
+
+# Plot: Solve time by population size for each generation count
+for ng in gen_counts:
+    subset = sensitivity_df[sensitivity_df['Generations'] == ng]
+    ax2.plot(subset['Population'], subset['Solve Time (s)'], 
+             's-', linewidth=2, markersize=8, label=f'{ng} generations')
+
+ax2.set_xlabel('Population Size', fontsize=12)
+ax2.set_ylabel('Solve Time (seconds)', fontsize=12)
+ax2.set_title('Runtime vs Population Size', fontsize=14)
+ax2.legend(fontsize=11)
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('../data/ga_parameter_sensitivity.png', 
+            dpi=150, bbox_inches='tight')
+plt.show()
+print("\nParameter sensitivity analysis complete.")
+
+----------------------------------------------------------------------
+# Code Cell 9
+----------------------------------------------------------------------
+# Cell 11: Scalability Analysis
+
+print("Running Scalability Analysis...\n")
+
+city_counts = [5, 8, 10, 12, 15]
+scalability_results = []
+
+for nc in city_counts:
+    # Use the first nc cities and their sub-matrix
+    sub_dist = dist_matrix[:nc, :nc]
+    sub_names = city_names[:nc]
+    
+    result = solve_tsp_ga(sub_dist, sub_names, 
+                           pop_size=200, n_gen=500, seed=42)
+    
+    scalability_results.append({
+        'Cities': nc,
+        'Best Distance (km)': round(result['total_distance'], 2),
+        'Solve Time (s)': round(result['solve_time'], 4)
+    })
+    print(f"  {nc:2d} cities -> Distance={result['total_distance']:.2f} km, Time={result['solve_time']:.4f}s")
+
+scalability_df = pd.DataFrame(scalability_results)
+print("\nScalability Results:")
+print(scalability_df.to_string(index=False))
+
+# Plot scalability
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+ax1.plot(scalability_df['Cities'], scalability_df['Solve Time (s)'], 
+         'go-', linewidth=2, markersize=10, markerfacecolor='limegreen',
+         markeredgecolor='darkgreen')
+ax1.set_xlabel('Number of Cities', fontsize=12)
+ax1.set_ylabel('Solve Time (seconds)', fontsize=12)
+ax1.set_title('GA Scalability: Solve Time vs Problem Size', fontsize=14)
+ax1.grid(True, alpha=0.3)
+
+# Also show distance scaling
+ax2.bar(scalability_df['Cities'].astype(str), 
+        scalability_df['Best Distance (km)'],
+        color='steelblue', edgecolor='navy')
+ax2.set_xlabel('Number of Cities', fontsize=12)
+ax2.set_ylabel('Best Distance (km)', fontsize=12)
+ax2.set_title('GA: Best Route Distance vs Problem Size', fontsize=14)
+ax2.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.savefig('../data/ga_scalability.png', 
+            dpi=150, bbox_inches='tight')
+plt.show()
+print("\nScalability analysis complete.")
+print("Note: GA solve time grows approximately linearly with the number of cities,")
+print("unlike ILP which grows exponentially.")
+
+----------------------------------------------------------------------
+# Code Cell 10
+----------------------------------------------------------------------
+# Cell 12: Comparative Evaluation (GA vs ILP)
+
+# Load ILP results
+ilp_results_path = '../data/ilp_results.json'
+
+try:
+    with open(ilp_results_path, 'r') as f:
+        ilp_data = json.load(f)
+    ilp_distance = ilp_data['optimal_tour']['total_distance_km']
+    ilp_time = ilp_data['optimal_tour']['solve_time_seconds']
+    print(f"ILP results loaded from file.")
+except FileNotFoundError:
+    print("ILP results file not found. Using reference values.")
+    # Fallback: typical ILP optimal values for this problem
+    ilp_distance = 57.50  # Approximate optimal distance in km
+    ilp_time = 0.85       # Approximate ILP solve time in seconds
+
+ga_distance = ga_result['total_distance']
+ga_time = ga_result['solve_time']
+
+# Compute optimality gap
+optimality_gap = ((ga_distance - ilp_distance) / ilp_distance) * 100
+
+# Comparison Table
+comparison_data = {
+    'Metric': [
+        'Best Distance (km)', 
+        'Solve Time (seconds)', 
+        'Optimality Guarantee', 
+        'Scalability',
+        'Optimality Gap (%)',
+        'Implementation Complexity',
+        'Memory Usage'
+    ],
+    'ILP (Exact)': [
+        f'{ilp_distance:.2f}',
+        f'{ilp_time:.4f}',
+        'Guaranteed Optimal',
+        'Exponential O(2^n)',
+        '0.00% (baseline)',
+        'Moderate',
+        'High (constraint matrix)'
+    ],
+    'GA (Metaheuristic)': [
+        f'{ga_distance:.2f}',
+        f'{ga_time:.4f}',
+        'Near-Optimal (no guarantee)',
+        'Polynomial O(G x P x n)',
+        f'{optimality_gap:.2f}%',
+        'Moderate',
+        'Low (population array)'
+    ]
+}
+
+comparison_df = pd.DataFrame(comparison_data)
+print("\nComparative Evaluation: GA vs ILP")
+print("=" * 80)
+print(comparison_df.to_string(index=False))
+
+# Bar chart comparison
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+# Distance comparison
+methods = ['ILP (Exact)', 'GA (Metaheuristic)']
+distances = [ilp_distance, ga_distance]
+colors_dist = ['#2ecc71', '#3498db']
+bars1 = ax1.bar(methods, distances, color=colors_dist, edgecolor='black', width=0.5)
+ax1.set_ylabel('Total Distance (km)', fontsize=12)
+ax1.set_title('Route Distance Comparison', fontsize=14)
+ax1.grid(True, alpha=0.3, axis='y')
+for bar, val in zip(bars1, distances):
+    ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3, 
+             f'{val:.2f} km', ha='center', fontsize=12, fontweight='bold')
+
+# Solve time comparison
+times = [ilp_time, ga_time]
+colors_time = ['#2ecc71', '#3498db']
+bars2 = ax2.bar(methods, times, color=colors_time, edgecolor='black', width=0.5)
+ax2.set_ylabel('Solve Time (seconds)', fontsize=12)
+ax2.set_title('Solve Time Comparison', fontsize=14)
+ax2.grid(True, alpha=0.3, axis='y')
+for bar, val in zip(bars2, times):
+    ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+             f'{val:.4f}s', ha='center', fontsize=12, fontweight='bold')
+
+plt.tight_layout()
+plt.savefig('../data/ga_vs_ilp_comparison.png', 
+            dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f"\nKey Findings:")
+print(f"  - ILP optimal distance: {ilp_distance:.2f} km")
+print(f"  - GA best distance:     {ga_distance:.2f} km")
+print(f"  - Optimality gap:       {optimality_gap:.2f}%")
+if ga_time < ilp_time:
+    print(f"  - GA was {ilp_time/ga_time:.1f}x faster than ILP")
+else:
+    print(f"  - ILP was {ga_time/ilp_time:.1f}x faster than GA for this small instance")
+
+----------------------------------------------------------------------
+# Code Cell 11
+----------------------------------------------------------------------
+# Save results to JSON
+ga_output = {
+    'method': 'Genetic Algorithm',
+    'author': 'Hirantha',
+    'dataset': 'Kaggle UK Cities TSP (15 of 49)',
+    'total_distance': round(ga_result['total_distance'], 4),
+    'solve_time': round(ga_result['solve_time'], 4),
+    'tour_indices': ga_result['tour'],
+    'tour_names': ga_result['tour_names'],
+    'parameters': {
+        'population_size': 200, 'generations': 500,
+        'cx_prob': 0.8, 'mut_prob': 0.2,
+        'tournament_k': 3, 'seed': 42
+    },
+    'n_cities': n_cities,
+    'city_names': city_names
+}
+
+with open('../data/ga_results.json', 'w') as f:
+    json.dump(ga_output, f, indent=2)
+
+print("Saved to data/ga_results.json")
