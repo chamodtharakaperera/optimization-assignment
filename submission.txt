@@ -5,4 +5,4 @@ https://www.kaggle.com/datasets/patricklford/travelling-salesman-problem
 https://github.com/chamodtharakaperera/optimization-assignment
 
 ## YouTube URL
-youtube.com
+https://youtu.be/D8kxKP_uOC0
