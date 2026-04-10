@@ -1,7 +1,5 @@
 """
 CODE APPENDIX — Delivery Route Optimization (TSP)
-Optimization Methods Programming Assignment
-Authors: Chamod (ILP) & Hirantha (GA)
 """
 
 # ---- SHARED: Dataset and Distance Matrix ----
@@ -11,10 +9,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import time
 import json
-
-# Kaggle dataset: "Travelling Salesman Problem: Visit 49 UK Cities"
-# https://www.kaggle.com/datasets/patricklford/travelling-salesman-problem
-# Selecting 15 cities for computational feasibility
 
 df = pd.read_csv('data/UK_Cities.csv')
 
